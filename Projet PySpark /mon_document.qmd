@@ -1,0 +1,569 @@
+---
+title: "Projet Big Data"
+author: "Audric Girondin"
+format:
+  html:
+    code-fold: true
+    code-tools: true
+    code-copy: true
+    toc: true
+    toc_float:
+      collapse: true
+jupyter: python3
+
+---
+## Introduction 
+
+Dans un contexte économique de plus en plus compétitif, la capacité d'une entreprise à analyser et exploiter efficacement ses données de vente est cruciale pour maintenir sa position sur le marché. Ce projet s'inscrit dans une démarche d'exploration des ventes d'une entreprise spécialisée dans l'électronique, en utilisant un ensemble de [données](https://www.kaggle.com/datasets/darkovichcycy/bd-sales?resource=download&select=Sales_August_2019.csv) provenant de Kaggle. L'objectif principal est d'identifier les produits les plus performants, d'analyser les tendances de vente, et de comprendre les facteurs influençant les revenus.
+
+Ce travail est réalisé dans le cadre de mon cours de Big Data, où j'apprends à gérer et analyser des données massives. L'utilisation de PySpark dans ce projet me permet de manipuler efficacement de grands volumes de données, ce qui est essentiel dans le traitement des données à grande échelle. Le projet comprend plusieurs étapes : le nettoyage des données, des analyses descriptives, des tests statistiques, du machine learning et le traitement de flux. En particulier, le test du Chi-deux a été utilisée pour évaluer s'il y a une dépendance entre la ville et le produit choisi, tandis que le clustering via KMEANS a permis de regrouper certains produits. Sans oublier le traitement des données en flux avec PySpark Streaming, qui permet une analyse en temps réel des données.
+
+## Configuration
+
+```{python}
+#install pyspark
+#!pip install pyspark
+# Spark SQL
+#!pip install pyspark[sql]
+```
+
+```{python}
+#import google drive
+#from google.colab import drive
+#drive.mount('/content/drive/')
+```
+
+```{python}
+
+# Import SparkSession
+from pyspark.sql import SparkSession
+# Create a Spark Session
+spark = SparkSession.builder.master("local[*]").getOrCreate()
+# Check Spark Session Information
+spark
+
+```
+
+## Importation des librairies
+
+```{python}
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import udf, col, sum, count, to_date, month, year, split, mean,explode, split, current_timestamp, window, pandas_udf
+from pyspark.sql.types import StringType, IntegerType
+from pyspark.sql import Row
+import seaborn as sns
+import matplotlib.pyplot as plt
+from pyspark.sql import functions as F
+from datetime import datetime
+from pyspark.ml.stat import Correlation
+from pyspark.ml.feature import VectorAssembler,StringIndexer,StandardScaler , PCA
+from pyspark.ml.stat import ChiSquareTest
+from scipy.stats import f
+import numpy as np
+import plotly.express as px
+import plotly.graph_objs as go
+from pyspark.ml.clustering import KMeans
+from pyspark.ml import Pipeline
+import pandas as pd 
+
+```
+## Chargement des données
+
+```{python}
+# lecture du fichier
+data = spark.read\
+    .option("delimiter", ",")\
+    .option("header", "true")\
+    .option("inferSchema", "true")\
+    .csv('New_Data.csv')
+
+data.printSchema()
+```
+
+```{python}
+data.show(5)
+```
+```{python}
+data_rdd = data.rdd
+data_rdd.take(5)
+```
+
+```{python}
+data.describe().show()
+```
+
+## Nettoyage des données
+
+En appliquant ces opérations de nettoyage, nous nous assurons que les données utilisées sont pertinentes et précises, ce qui renforce la fiabilité des résultats de nos futures analyses. 
+
+```{python}
+# dropna
+data = data.dropna()
+
+def clean_product_name(product_name):
+    return product_name.strip().upper()
+
+clean_product_name_udf = udf(clean_product_name, StringType())
+
+# Application de l'UDF pour nettoyer les noms de produits
+data = data.withColumn("Product", clean_product_name_udf(data["Product"]))
+
+# Filtrer les transactions improbables
+data = data.filter((data['`Quantity Ordered`'] > 0) & (data['`Price Each`'] > 0))
+
+data_rdd = data.rdd
+
+# On cache les données nettoyées pour les réutiliser plus tard
+data.cache()
+data.show(5)
+```
+
+## Analyse Descriptive
+### Les 10 produits les plus vendus
+
+Dans un premier temps, l'objectif est de déterminer les produits les plus vendus en regroupant les données par produit et en calculant la somme des quantités commandées pour chacun d'eux. En classant ces produits par ordre décroissant de quantités vendues, nous identifions les dix produits les plus populaires parmi les clients.
+
+Cette analyse est essentielle pour comprendre les préférences des consommateurs et identifier les articles qui génèrent le plus de volume de ventes. En sachant quels produits sont les plus demandés, l'entreprise peut optimiser ses stratégies de stock, ajuster ses campagnes publicitaires pour mettre en avant ces produits, et mieux prévoir les besoins futurs en fonction des tendances de vente. 
+
+Les 10 produits les plus vendus sont (sous forme de df) :
+```{python}
+# Répartition des données sur la colonne "Product" avant les agrégations répétées
+data = data.repartition(8, "Product")
+# Grouper par produit et la somme des quantités
+top_selling_products = data.groupBy("Product").agg(sum("`Quantity Ordered`").alias("TotalQuantity"))
+
+# print des 10 produits les plus vendus 
+
+top_selling_products.orderBy("TotalQuantity", ascending=False).show(10)
+
+```
+
+
+Les 10 produits les plus vendus sont (sous forme de rdd) :
+```{python}
+# Transformation de l'RDD pour extraire les colonnes nécessaires
+product_quantity_rdd = data_rdd.map(lambda row: (row['Product'], row['Quantity Ordered']))
+
+# Agréger les quantités par produit, en gérant les valeurs None
+# Si x ou y est None, on le remplace par 0 avant l'addition
+total_quantity_per_product_rdd = product_quantity_rdd.reduceByKey(lambda x, y: (x if x is not None else 0) + (y if y is not None else 0))
+
+# Convertir en un RDD de Row pour un affichage facile
+top_selling_products_rdd = total_quantity_per_product_rdd.map(lambda x: Row(Product=x[0], TotalQuantity=x[1]))
+
+# Trier les produits par quantité totale commandée en ordre décroissant
+sorted_top_selling_products_rdd = top_selling_products_rdd.sortBy(lambda x: x['TotalQuantity'], ascending=False)
+
+sorted_top_selling_products_rdd.take(10)
+
+```
+
+### Les 10 produits les plus rentables
+
+Ici l'objectif est de calculer le revenu total généré par chaque produit en multipliant la quantité commandée par le prix unitaire pour chaque transaction. En regroupant ensuite les données par produit, nous sommes en mesure de déterminer quels sont les produits les plus rentables en termes de revenus générés.
+
+Cette analyse est particulièrement utile pour identifier les produits phares de l'entreprise, c'est-à-dire ceux qui contribuent le plus au chiffre d'affaires. En comprenant quels produits sont les plus rentables, l'entreprise pourra donc optimiser son inventaire, concentrer ses efforts de marketing sur ces produits, et mieux allouer ses ressources pour maximiser les profits. De plus, cette information peut être utilisée pour faire des projections financières et ajuster les stratégies de vente en fonction des performances réelles des produits.
+
+```{python}
+#Calculate total revenue for each product
+data = data.withColumn("Revenue", col("Quantity Ordered") * col("Price Each"))
+
+# Persistance du DataFrame avec les revenus pour éviter de recalculer
+data.persist()
+
+# Grouper par  produit et  calcul du revenue total
+revenue_by_product = data.groupBy("Product").agg(sum("Revenue").alias("TotalRevenue"))
+
+print("Les 10 produits les plus rentables sont :")
+revenue_by_product.orderBy("TotalRevenue", ascending=False).show(10)
+
+```
+
+### Tendance des ventes mensuelles
+
+En ce qui concerne l'analyse suivante, l'objectif est d'examiner la tendance des ventes mensuelles de l'entreprise en visualisant l'évolution des revenus au fil du temps.
+
+Elle permet de révéler des insights sur le comportement d'achat des clients, aider à identifier les mois les plus rentables, et permettre à l'entreprise de mieux planifier ses stratégies marketing et ses opérations commerciales en fonction des tendances observées. Voir @fig-lineplot.
+
+```{python}
+#Utiliser un udf classique t un pandas_udf
+# Définir la fonction pour extraire le mois
+@pandas_udf(IntegerType())
+def extract_month_pandas_udf(order_date: pd.Series) -> pd.Series:
+    return order_date.apply(lambda date: datetime.strptime(date, '%m/%d/%y %H:%M').month)
+
+# Définir la fonction pour extraire l'année
+def extract_year(order_date):
+    date_obj = datetime.strptime(order_date, '%m/%d/%y %H:%M')
+    return date_obj.year
+
+extract_year_udf = udf(extract_year, IntegerType())
+
+# Appliquer les UDFs pour créer les colonnes Month et Year
+data = data.withColumn("Month", extract_month_pandas_udf(data["Order Date"]))
+data = data.withColumn("Year", extract_year_udf(data["Order Date"]))
+
+```
+
+```{python}
+# Repartitionner les données avant l'agrégation
+data = data.repartition(8, "Year", "Month")
+
+# Grouper par mois et année pour voirs les revenues du mois 
+monthly_sales = data.groupBy("Month", "Year").agg(sum("Revenue").alias("TotalRevenue"))
+
+# Show sales trends
+monthly_sales.orderBy("Year", "Month").show()
+```
+
+```{python}
+#| label: fig-lineplot
+#| fig-cap: "lineplot sur l'évolutions des revenus par mois"
+
+# Convertir en DataFrame Pandas
+monthly_sales_pd = monthly_sales.toPandas()
+
+# Combiner l'année et le mois en une seule colonne pour une meilleure visualisation
+monthly_sales_pd['YearMonth'] = monthly_sales_pd['Year'].astype(str) + '-' + monthly_sales_pd['Month'].astype(str)
+
+# Configuration du style Seaborn
+sns.set(style="whitegrid")
+
+# Création du graphique de tendance des ventes mensuelles
+plt.figure(figsize=(12, 6))
+sns.lineplot(
+    data=monthly_sales_pd,
+    x='YearMonth',
+    y='TotalRevenue',
+    marker='o',
+    color='r'
+)
+
+# Configuration des axes et des labels
+plt.title('Tendance des ventes mensuelles')
+plt.xlabel('Year-Month')
+plt.ylabel('Revenu total')
+plt.xticks(rotation=45)
+plt.grid(True)
+
+# Affichage du graphique
+plt.show()
+```
+
+### Chiffre d'affaires des 5 principaux produits dans différentes villes
+
+Nous cherchons à identifier les cinq produits les plus rentables, puis d'analyser leur performance en termes de revenus dans différentes villes. 
+
+Cette analyse permet de visualiser comment les produits les plus rentables se comportent dans différentes localités, ce qui peut révéler des tendances géographiques dans les préférences des clients. Une telle analyse est cruciale pour adapter les stratégies de vente et de marketing en fonction des régions, optimiser les opérations logistiques, et cibler les efforts commerciaux là où ils sont les plus efficaces. En visualisant ces données à l'aide d'un graphique en barres, nous obtenons un aperçu clair des performances des principaux produits dans les différentes villes. Voir @fig-barplot.
+
+```{python}
+#| label: fig-barplot
+#| fig-cap: "barplot sur les revenus des produits les plus rentables par villes"
+
+# Obtenir les 5 produits les plus rentables
+top_5_products = revenue_by_product.orderBy("TotalRevenue", ascending=False).limit(5)
+
+# Récupérer les noms des 5 produits les plus rentables
+top_5_product_names = [row['Product'] for row in top_5_products.collect()]
+
+# fonction pour extraire la ville à partir de l'adresse
+def extract_city(purchase_address):
+    try:
+        return purchase_address.split(",")[1].strip()
+    except IndexError:
+        return None  # Au cas où le format ne correspondrait pas
+
+# fonction comme UDF
+extract_city_udf = udf(extract_city, StringType())
+
+data = data.withColumn("City", extract_city_udf(data["Purchase Address"]))
+
+# Filtrer les données pour ne conserver que les 5 produits les plus rentables
+filtered_data = data.filter(data['Product'].isin(top_5_product_names))
+
+# Regrouper par produit et ville pour obtenir le revenu par produit et par ville
+product_city_performance = filtered_data.groupBy("City", "Product").agg(
+    sum("Revenue").alias("TotalRevenue")
+)
+
+# Convertir en Pandas pour une analyse plus facile
+product_city_performance_pd = product_city_performance.orderBy("City", "TotalRevenue", ascending=False).toPandas()
+
+# Création du graphique avec Seaborn
+plt.figure(figsize=(14, 8))
+sns.set(style="whitegrid")
+
+# Barplot avec Seaborn
+sns.barplot(
+    data=product_city_performance_pd,
+    x="City",
+    y="TotalRevenue",
+    hue="Product",
+    palette="tab10"
+)
+
+# Configuration des axes et des labels
+plt.xlabel('Villes')
+plt.ylabel('Revenue Total')
+plt.title("Chiffre d'affaires des 5 principaux produits dans différentes villes")
+plt.xticks(rotation=45)
+plt.legend(title='Produits')
+plt.grid(True)
+
+# Affichage du graphique
+plt.show()
+```
+
+### Analyse en Composantes Principales (ACP)
+
+Ici, nous appliquons une Analyse en Composantes Principales (ACP) sur notre jeu de données, qui ne contient actuellement que deux colonnes numériques : "Quantity Ordered" et "Price Each". L'ACP est une technique de réduction de dimensionnalité qui nous permet d'identifier les axes principaux de variation dans les données et de concentrer l'information sur un nombre réduit de composantes.
+Néanmoins dans un contexte où nous aurions plus de variables numériques, l'ACP serait particulièrement intéressante. Elle nous permettrait didentifier les variables les plus explicatives et d'isoler les dimensions qui capturent la majorité de la variance dans les données.
+
+```{python}
+# Étape 1 : Assembler les colonnes numériques en un vecteur
+numeric_columns = ["Quantity Ordered", "Price Each"]  
+assembler = VectorAssembler(inputCols=numeric_columns, outputCol="features")
+
+# Étape 2 : Normaliser les données avec StandardScaler
+scaler = StandardScaler(inputCol="features", outputCol="scaled_features", withMean=True, withStd=True)
+
+# Étape 3 : Appliquer l'ACP (PCA)
+pca = PCA(k=2, inputCol="scaled_features", outputCol="pca_features")  
+
+pipeline = Pipeline(stages=[assembler, scaler, pca])
+
+# Entraîner le pipeline
+model = pipeline.fit(data)
+
+# Transformer les données
+pca_result = model.transform(data)
+
+explained_variance = model.stages[-1].explainedVariance  # La dernière étape du pipeline est PCA
+
+# Afficher la variance expliquée
+print("Variance expliquée par composante : ", explained_variance)
+
+```
+
+La première composante principale (Quantity Ordered) explique 57,41% de la variance, tandis que la deuxième composante principale (Price Each) explique les 42,59% restants. Cela signifie que nos deux variables capturent ensemble toute la variance présente dans les données, même si la première composante est légèrement plus dominante.
+
+## Tests statistiques
+### Matrice de corrélation 
+
+Pour analyser la relation entre différentes variables numériques dans un jeu de données. En calculant la matrice de corrélation, on peut de déterminer la relation entre les colonnes sélectionnées, ce qui peut aider à identifier des tendances ou des dépendances significatives entre les variables telles que la quantité commandée et le prix unitaire. Voir @fig-heatmap.
+
+```{python}
+def calculate_correlation_matrix(df, cols):
+    """
+    Calcule la matrice de corrélation pour les colonnes spécifiées provenant d'un dataframe
+
+    Args:
+    df : dataframe.
+    cols (list of str): Liste des noms des colonnes pour lesquelles la corrélation doit être calculée.
+
+    Returns:
+    correlation_matrix: Matrice de corrélation.
+    """
+
+    # Sélection des colonnes pertinentes pour la corrélation
+    assembler = VectorAssembler(inputCols=cols, outputCol="features")
+    vector_data = assembler.transform(df).select("features")
+
+    # Calcul de la matrice de corrélation
+    correlation_matrix = Correlation.corr(vector_data, "features").head()[0]
+
+    return correlation_matrix
+
+# Exemple d'utilisation
+columns = ["Quantity Ordered", "Price Each"]
+correlation_matrix = calculate_correlation_matrix(data, columns)
+print("Matrice de corrélation :\n", correlation_matrix)
+
+```
+
+```{python}
+#| label: fig-heatmap
+#| fig-cap: "heatmap sur la matrice de corrélation"
+
+# Convertir la matrice de corrélation en un tableau NumPy
+correlation_matrix_np = correlation_matrix.toArray()
+
+sns.heatmap(correlation_matrix_np, annot=True, xticklabels=columns, yticklabels=columns, cmap='coolwarm')
+
+plt.title("Matrice de Corrélation")
+plt.show()
+
+```
+
+La corrélation légèrement négative entre le prix unitaire et la quantité commandée (-0,148) suggère que les produits plus chers sont généralement achetés en plus petites quantités, bien que cet effet soit faible et que d'autres facteurs puissent influencer les commandes.
+
+## Test du Chi-deux
+
+Le test du Chi-deux est un test statistique qui permet de déterminer si deux variables catégorielles sont indépendantes ou non. Dans notre cas, nous allons utiliser ce test pour évaluer si la ville d'achat influence le choix du produit. En d'autres termes, nous voulons savoir si le choix du produit est lié à la ville où il est acheté.
+```{python}
+
+# Indexer la colonne catégorielle (par exemple, "Product")
+product_indexer = StringIndexer(inputCol="Product", outputCol="ProductIndex")
+city_indexer = StringIndexer(inputCol="City", outputCol="CityIndex")
+
+# Assembler les features en un vecteur pour le test
+assembler = VectorAssembler(inputCols=["ProductIndex"], outputCol="features")
+
+# Créer le pipeline
+pipeline = Pipeline(stages=[product_indexer,city_indexer, assembler])
+
+# Entraîner le pipeline
+model = pipeline.fit(data)
+
+# Transformer les données
+transformed_df = model.transform(data)
+
+# Appliquer le test du chi-deux
+chi_square_result = ChiSquareTest.test(transformed_df, "features", "CityIndex")
+
+# Afficher les résultats
+chi_square_result.show()
+
+```
+D'après ce test, il n'y a pas de preuve statistique que les ventes de produits dépendent de la ville où elles sont réalisées car nous avons une p-value > 0,05 .
+
+## Machine Learning
+
+### Clustering 
+
+Ce code réalise une analyse des données de vente d'une entreprise en utilisant PySpark. L'objectif est de regrouper les produits en clusters en fonction de la quantité totale vendue et du prix unitaire moyen, afin d'identifier des tendances et des segments de produits similaires. Voir @fig-scatterplot.
+
+```{python}
+# Conversion des colonnes en types numériques
+df = data.withColumn("Quantity Ordered", col("Quantity Ordered").cast("float"))
+df = data.withColumn("Price Each", col("Price Each").cast("float"))
+
+# Agrégation des données par produit
+product_group_df = df.groupBy("Product").agg(
+    sum("Quantity Ordered").alias("Total Quantity Ordered"),
+    mean("Price Each").alias("Price Each")
+)
+
+product_group_df.persist()
+
+# Assembler les features en un vecteur
+assembler = VectorAssembler(
+    inputCols=["Total Quantity Ordered", "Price Each"],
+    outputCol="features"
+)
+
+# Normalisation des données
+scaler = StandardScaler(inputCol="features", outputCol="scaled_features", withStd=True, withMean=False)
+
+# Appliquer KMeans
+kmeans = KMeans(featuresCol='scaled_features', k=3, seed=42)
+
+# Définir les étapes du pipeline
+pipeline = Pipeline(stages=[assembler, scaler, kmeans])
+
+#Entrainement du model
+model = pipeline.fit(product_group_df)
+
+#application du modele
+clusters_df = model.transform(product_group_df)
+
+# Renommer la colonne 'prediction' en 'cluster'
+clusters_df = clusters_df.withColumnRenamed('prediction', 'cluster')
+
+# Afficher les résultats
+clusters_df.select("Product","cluster").show()
+
+```
+
+```{python}
+#| label: fig-scatterplot
+#| fig-cap : "scatterplot sur le clustering des produits"
+
+result_cluster_pd = clusters_df.toPandas()
+
+# Créer le scatter plot interactif
+fig = px.scatter(
+    result_cluster_pd,
+    x="Total Quantity Ordered",
+    y="Price Each",
+    color="cluster",
+    hover_data=["Product"],  # Affiche le nom du produit lors du survol
+    title="Clustering des Produits",
+    color_continuous_scale=px.colors.sequential.Bluered
+
+)
+
+# Afficher la figure
+fig.show()
+```
+
+```{python}
+
+clusters_df.groupBy("cluster").agg(
+    F.count("Product").alias("Number of Products"),
+    F.mean("Price Each").alias("Average Price Each"),
+    F.mean("Total Quantity Ordered").alias("Average Quantity Ordered")
+).sort("cluster").show()
+
+```
+
+Nous pouvons aussi utiliser les PCA features pour faire notre cluster, et nous avons les mêmes résultats.
+```{python}
+
+# Appliquer KMeans
+kmeans = KMeans(featuresCol='pca_features', k=3, seed=42)
+
+# Définir les étapes du pipeline
+pipeline = Pipeline(stages=[kmeans])
+
+#Entrainement du model
+model = pipeline.fit(pca_result)
+
+#application du modele
+clusters_df_pca = model.transform(pca_result)
+
+# Renommer la colonne 'prediction' en 'cluster'
+clusters_df_pca = clusters_df.withColumnRenamed('prediction', 'cluster')
+
+# Afficher les résultats
+clusters_df_pca.select("Product","cluster").show()
+```
+
+## Flux de données en temps réel
+
+Ce code est utile pour effectuer une analyse en temps réel des données reçues via une connexion socket. En utilisant des fenêtres temporelles, il permet d'agréger et de compter les occurrences des mots sur des intervalles de 1 minute. Les résultats sont ensuite sauvegardés dans une table Spark afin d'effectuer des requêtes plus tard.
+
+Adaptée à notre contexte, cette approche permet une réaction en temps réel aux tendances du marché en traitant les données de vente dès leur génération.
+
+### Serveur Socket
+
+```{python}
+#| eval: false
+import socket
+import time
+
+# Configuration du serveur socket
+server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server_socket.bind(('localhost', 9999))  # Hôte et port
+server_socket.listen(1)  # Permettre une seule connexion client
+
+print("Serveur socket en attente de connexion...")
+conn, addr = server_socket.accept()  # Accepter la connexion
+
+print(f"Connexion établie avec {addr}")
+
+# Envoyer des données à intervalles réguliers
+phrases = ['hello world', 'this is a test', 'spark streaming with socke', 'structured streaming example','La souris cherche la pomme', 'Le chien déteste le ballon', 'Le chien mange la maison', 'Le professeur construit le jardin', 'Le garçon voit le ballon', "L'éléphant aime le jardin", 'Le chien voit le travail', "L'éléphant mange le fromage", 'Le chien déteste le travail', 'La souris enseigne le fromage', "L'étudiant apprend la musique", "L'étudiant aime le livre", 'La fille mange le fromage', "La voiture apprend l'école", "L'éléphant aime la musique", "L'étudiant aime le livre", 'La voiture construit le livre', 'La voiture cherche le film', 'La souris aime le fromage', 'La souris détruit le jardin', "L'oiseau cherche le travail", 'Le professeur cherche le livre', "Le professeur mange l'école", "L'étudiant apprend le film", 'La fille voit la maison', 'Le professeur construit le ballon', "L'étudiant aime le ballon", "L'oiseau mange la maison", 'Le garçon cherche le film', "L'éléphant enseigne le film", 'La fille cherche le film', "L'éléphant détruit le fromage", 'Le garçon apprend la pomme', 'La voiture aime la musique', "L'éléphant détruit le ballon", 'Le chien mange le film', 'Le professeur déteste le film', 'Le chien déteste le travail', "L'étudiant détruit le ballon", "L'éléphant trouve la pomme", 'Le chat construit le livre', "L'oiseau apprend le jardin", 'La souris aime le jardin', 'Le professeur enseigne le film', 'Le professeur construit le jardin', 'Le chat voit la musique', "L'étudiant déteste le fromage", 'La voiture apprend la pomme', "L'étudiant construit la musique", 'Le garçon construit le livre', 'Le chat voit le ballon', 'Le chien construit le travail', "L'étudiant construit le livre", "L'éléphant enseigne le film", "L'étudiant apprend le film", 'Le chat mange la maison', 'La fille construit le fromage', "L'étudiant mange la maison", 'Le garçon enseigne le jardin', 'Le professeur apprend le fromage', "Le chien détruit l'école", "L'étudiant déteste la pomme", "L'éléphant trouve le travail", 'Le chat apprend le jardin', 'Le professeur mange le jardin', "L'éléphant déteste la musique", 'La voiture trouve la maison', 'Le professeur détruit la maison', 'Le chat mange la pomme', 'La voiture déteste la pomme', "L'étudiant enseigne le jardin", "L'étudiant détruit le film", 'Le chien voit le ballon', "L'oiseau trouve le film", "L'oiseau détruit la musique", "L'éléphant construit le jardin", "L'éléphant apprend la maison", 'La souris déteste le travail', 'La souris aime la musique', 'La voiture déteste le jardin', "Le garçon apprend l'école", "L'éléphant cherche le jardin", 'La souris apprend le travail', 'La fille mange la pomme', 'La souris déteste le fromage', 'La voiture apprend le ballon', "L'oiseau apprend l'école", "Le chien enseigne l'école", 'La voiture trouve la pomme', 'Le professeur cherche la musique', 'Le chat trouve la musique', 'La voiture détruit le fromage', "L'éléphant enseigne le jardin", "L'oiseau voit le jardin", "L'éléphant enseigne le livre", "L'étudiant enseigne le film", 'Le chat détruit le livre', 'Le chat aime le jardin', 'Le chat apprend le livre', "L'étudiant construit le livre"]
+while True:
+    for text in phrases:
+        conn.send((text + "\n").encode())  # Envoyer un message avec un saut de ligne
+        print(f"Envoyé : {text}")
+        time.sleep(2)  # Pause de 2 secondes avant d'envoyer le prochain message
+
+conn.close()
+
+```
+### Traitement des données en temps réel
+
+![Code flux in Pyspark](project_streaming.pdf){ width=600px height=800px }
+
